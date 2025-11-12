@@ -41,6 +41,8 @@ python main.py fetch --source api --query "math tutor Delhi" --limit 30
 - **Google Custom Search API**: Most reliable method (100% success rate)
 - **Multi-Source Scraping**: Google API, UrbanPro, Superprof, direct platforms
 - **Smart Classification**: Auto-detects role, subjects, location, experience
+- **Experience Filtering**: Filter tutors by years of experience (< 5 years, etc.)
+- **Student Exclusion**: Option to focus only on tutors and exclude students
 - **Flexible Storage**: CSV files or MongoDB
 - **Rotating User-Agents**: Avoid detection
 - **Error Handling**: Robust retry logic
@@ -171,6 +173,28 @@ python main.py --help    # Show help
 --limit, -l     : Max results [default: 20]
 --output, -o    : Format (csv, mongo, both) [default: csv]
 --output-path, -p : Custom path (optional)
+--max-experience, -e : Filter tutors with experience less than specified years
+--exclude-students : Exclude student profiles (focus only on tutors)
+```
+
+### 🎯 Advanced Filtering
+
+#### Filter by Experience
+```bash
+# Get tutors with less than 5 years of experience
+python main.py fetch --source api --query "math tutor Delhi" --max-experience 5 --limit 30
+
+# Get tutors with less than 3 years of experience
+python main.py fetch --source api --query "physics tutor" --max-experience 3 --exclude-students
+```
+
+#### Focus Only on Tutors (Exclude Students)
+```bash
+# Exclude student profiles from results
+python main.py fetch --source api --query "tutor" --exclude-students --limit 50
+
+# Combined with experience filter
+python main.py fetch --source api --query "chemistry tutor" --max-experience 5 --exclude-students
 ```
 
 ## 📁 Project Structure

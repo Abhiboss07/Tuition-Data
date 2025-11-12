@@ -130,3 +130,101 @@ def extract_experience(text: str) -> Optional[str]:
         return match.group(1)
     
     return None
+
+
+def parse_experience_years(experience_str: str) -> Optional[int]:
+    """
+    Parse experience string to extract numeric years
+    
+    Args:
+        experience_str: Experience string (e.g., "5 years", "10+ years")
+    
+    Returns:
+        Number of years as integer or None if not found
+    """
+    if not experience_str:
+        return None
+    
+    # Extract number from experience string
+    exp_pattern = r'(\d+)\+?\s*(?:years?|yrs?)'
+    match = re.search(exp_pattern, experience_str.lower())
+    
+    if match:
+        return int(match.group(1))
+    
+    return None
+
+
+def filter_tutors_by_experience(data: list, max_years: int = 5) -> list:
+    """
+    Filter tutors to only include those with experience less than specified years
+    
+    Args:
+        data: List of profile dictionaries
+        max_years: Maximum years of experience to include (default: 5)
+    
+    Returns:
+        Filtered list of tutor profiles
+    """
+    filtered_tutors = []
+    
+    for profile in data:
+        # Only process tutors
+        if profile.get('role') != 'Tutor':
+            continue
+        
+        experience_str = profile.get('experience', '')
+        experience_years = parse_experience_years(experience_str)
+        
+        # Include tutors only if we can determine years and it is strictly less than max_years
+        if experience_years is not None and experience_years < max_years:
+            filtered_tutors.append(profile)
+    
+    return filtered_tutors
+
+
+def is_indian_profile(profile: dict) -> bool:
+    """
+    Heuristic to determine if a profile belongs to India based on location or text.
+    
+    Args:
+        profile: Profile dict with optional 'location', 'description', 'title', 'name'
+    
+    Returns:
+        True if the profile likely belongs to India, else False
+    """
+    if not isinstance(profile, dict):
+        return False
+    
+    # If location already extracted and clearly Indian
+    loc = (profile.get('location') or '').strip()
+    if loc:
+        loc_l = loc.lower()
+        if 'india' in loc_l:
+            return True
+        indian_cities = [
+            'delhi', 'new delhi', 'mumbai', 'bombay', 'bangalore', 'bengaluru', 'chennai', 'kolkata',
+            'hyderabad', 'pune', 'ahmedabad', 'jaipur', 'lucknow', 'kanpur', 'nagpur', 'indore',
+            'bhopal', 'visakhapatnam', 'vizag', 'surat', 'patna', 'vadodara', 'gurgaon', 'noida',
+            'thane', 'faridabad', 'ghaziabad', 'ludhiana', 'agra', 'nashik', 'pimpri', 'aurangabad',
+            'rajkot', 'meerut', 'varanasi', 'madurai', 'coimbatore', 'trichy', 'tiruchirappalli',
+            'mangalore', 'kochi', 'trivandrum', 'thiruvananthapuram', 'bhubaneswar', 'ranchi',
+            'guwahati', 'amritsar', 'dehradun', 'jalandhar', 'gwalior', 'jodhpur', 'raipur'
+        ]
+        for city in indian_cities:
+            if city in loc_l:
+                return True
+    
+    # Fallback: check combined text for India hints
+    text = ' '.join([
+        str(profile.get('name') or ''),
+        str(profile.get('title') or ''),
+        str(profile.get('description') or ''),
+    ]).lower()
+    if any(word in text for word in ['india', 'indian']):
+        return True
+    # Common city mentions in text
+    for hint in ['delhi', 'mumbai', 'bangalore', 'bengaluru', 'chennai', 'kolkata', 'hyderabad', 'pune', 'ahmedabad', 'jaipur']:
+        if hint in text:
+            return True
+    return False

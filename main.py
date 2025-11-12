@@ -21,6 +21,7 @@ from scraper.google_api_scraper import GoogleAPISearcher
 from scraper.direct_scraper import UniversalTutorScraper
 from utils.storage import save_data
 from utils.logger import logger
+from utils.classifier import filter_tutors_by_experience, is_indian_profile
 
 # Load environment variables
 load_dotenv()
@@ -111,6 +112,32 @@ def fetch(
         "--output-path",
         "-p",
         help="Custom CSV output path"
+    ),
+    max_experience: Optional[int] = typer.Option(
+        None,
+        "--max-experience",
+        "-e",
+        help="Filter tutors with experience less than specified years (e.g., 5 for < 5 years)"
+    ),
+    exclude_students: bool = typer.Option(
+        False,
+        "--exclude-students",
+        help="Exclude student profiles from results (focus only on tutors)"
+    ),
+    india_only: bool = typer.Option(
+        False,
+        "--india-only",
+        help="Keep only profiles likely from India (based on location/text)"
+    ),
+    max_save: int = typer.Option(
+        100,
+        "--max-save",
+        help="Maximum number of profiles to save after filtering"
+    ),
+    append: bool = typer.Option(
+        False,
+        "--append",
+        help="Append to CSV instead of overwriting"
     )
 ):
     """
@@ -118,6 +145,7 @@ def fetch(
     
     Example:
         python main.py fetch --source google --query "math tutor Delhi" --limit 20 --output csv
+        python main.py fetch --source api --query "tutor" --max-experience 5 --exclude-students
     """
     create_env_if_missing()
     
@@ -125,7 +153,17 @@ def fetch(
     console.print(f"[bold]Query:[/bold] {query}")
     console.print(f"[bold]Source:[/bold] {source}")
     console.print(f"[bold]Limit:[/bold] {limit}")
-    console.print(f"[bold]Output:[/bold] {output}\n")
+    console.print(f"[bold]Output:[/bold] {output}")
+    
+    if max_experience:
+        console.print(f"[bold]Max Experience:[/bold] < {max_experience} years")
+    if exclude_students:
+        console.print(f"[bold]Student Filtering:[/bold] Excluded")
+    if india_only:
+        console.print(f"[bold]Region Filter:[/bold] India-only")
+    if max_save:
+        console.print(f"[bold]Max Save:[/bold] {max_save}")
+    console.print()
     
     all_results = []
     
@@ -204,6 +242,39 @@ def fetch(
         console.print("[yellow]No data collected. Try a different query or source.[/yellow]")
         raise typer.Exit(0)
     
+    # Apply filters
+    original_count = len(all_results)
+    
+    # Exclude students if requested
+    if exclude_students:
+        all_results = [profile for profile in all_results if profile.get('role') != 'Student']
+        console.print(f"[yellow]📊 Excluded students: {original_count - len(all_results)} profiles[/yellow]")
+
+    # Filter by experience if requested
+    if max_experience:
+        filtered_tutors = filter_tutors_by_experience(all_results, max_experience)
+        # Keep non-tutor profiles that weren't filtered by experience
+        non_tutors = [profile for profile in all_results if profile.get('role') != 'Tutor']
+        all_results = filtered_tutors + non_tutors
+        console.print(f"[yellow]📊 Applied experience filter (< {max_experience} years): {original_count - len(all_results)} profiles excluded[/yellow]")
+
+    # India-only filter
+    if india_only:
+        before = len(all_results)
+        all_results = [p for p in all_results if is_indian_profile(p)]
+        console.print(f"[yellow]📊 India-only filter: {before - len(all_results)} profiles excluded[/yellow]")
+
+    # Cap results to max_save
+    if max_save and len(all_results) > max_save:
+        all_results = all_results[:max_save]
+        console.print(f"[yellow]📊 Capped results to max-save: {max_save}[/yellow]")
+    
+    console.print(f"[bold green]✓ Final results after filtering: {len(all_results)}[/bold green]\n")
+    
+    if not all_results:
+        console.print("[yellow]No data remaining after filtering. Try adjusting your filters.[/yellow]")
+        raise typer.Exit(0)
+    
     # Display top results
     display_results_table(all_results, top_n=5)
     
@@ -211,7 +282,7 @@ def fetch(
     console.print("[cyan]💾 Saving data...[/cyan]\n")
     
     csv_path = output_path or "data/tutors.csv"
-    success = save_data(all_results, output_format=output, output_path=csv_path)
+    success = save_data(all_results, output_format=output, output_path=csv_path, separate_by_role=True, append_mode=append)
     
     if success:
         console.print(f"[bold green]✓ Data collection complete![/bold green]")

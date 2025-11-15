@@ -26,6 +26,18 @@ python main.py fetch --source api --query "math tutor Delhi" --limit 30
 # - data/students.csv (1 student)
 ```
 
+### Bulk Collect (3000+ Tutors, India)
+```bash
+# Recommended: add multiple Google API keys to .env for rotation
+# GOOGLE_API_KEY=key1,key2,key3
+# GOOGLE_SEARCH_ENGINE_ID=cx1,cx2
+
+# Bulk mode focuses on Indian tutors for classes 1–12 across subjects and cities
+python main.py bulk --target 3000 --output csv --output-path data/tutors_bulk.csv --workers 6 --flush-every 250
+
+# You can re-run safely; CSV is deduplicated across runs by profile_link (or name|source)
+```
+
 ### ✅ TESTED & WORKING - 100+ Results!
 **Latest collection (using all 6 API keys):**
 - ✅ **84 TUTORS** saved to `data/tutors.csv` (22 KB)
@@ -175,6 +187,10 @@ python main.py --help    # Show help
 --output-path, -p : Custom path (optional)
 --max-experience, -e : Filter tutors with experience less than specified years
 --exclude-students : Exclude student profiles (focus only on tutors)
+--india-only / --no-india-only : Keep only Indian profiles (bulk default: on)
+--workers, -w  : Concurrency for bulk mode (default: 6)
+--flush-every  : Flush to CSV every N new profiles in bulk mode (default: 250)
+--target, -t   : Target number of profiles in bulk mode (default: 3000)
 ```
 
 ### 🎯 Advanced Filtering
@@ -195,6 +211,20 @@ python main.py fetch --source api --query "tutor" --exclude-students --limit 50
 
 # Combined with experience filter
 python main.py fetch --source api --query "chemistry tutor" --max-experience 5 --exclude-students
+```
+
+#### 3. Bulk Mode (High Throughput)
+Collect thousands of Indian tutor profiles across subjects and cities with concurrency. Data is periodically flushed to CSV and deduplicated across runs.
+
+```bash
+# Default target is 3000 profiles
+python main.py bulk --target 3000 --output csv --output-path data/tutors_bulk.csv --workers 6 --flush-every 250
+
+# If facing rate limits or blocks, reduce concurrency
+python main.py bulk --target 3000 --workers 4
+
+# Include all profiles (disable India-only and student exclusion)
+python main.py bulk --target 3000 --no-india-only --include-students
 ```
 
 ## 📁 Project Structure

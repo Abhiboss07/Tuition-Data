@@ -3,8 +3,10 @@ TuitionDataCollector - CLI tool for scraping tutor/student data
 """
 import os
 import sys
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Tuple, Dict, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -19,6 +21,7 @@ from scraper.urbanpro_scraper import UrbanProScraper
 from scraper.superprof_scraper import SuperprofScraper
 from scraper.google_api_scraper import GoogleAPISearcher
 from scraper.direct_scraper import UniversalTutorScraper
+from scraper.async_playwright_scraper import run_async_scrape
 from utils.storage import save_data
 from utils.logger import logger
 from utils.classifier import filter_tutors_by_experience, is_indian_profile
@@ -316,6 +319,163 @@ def init():
     console.print("2. Run: python main.py fetch --query 'your search query'\n")
 
 
+@app.command()
+def bulk(
+    target_count: int = typer.Option(
+        3000,
+        "--target",
+        "-t",
+        help="Target number of tutor profiles to collect"
+    ),
+    output: str = typer.Option(
+        "csv",
+        "--output",
+        "-o",
+        help="Output format: csv, mongo, or both"
+    ),
+    output_path: Optional[str] = typer.Option(
+        "data/tutors.csv",
+        "--output-path",
+        "-p",
+        help="CSV path to save (append mode)"
+    ),
+    max_workers: int = typer.Option(
+        6,
+        "--workers",
+        "-w",
+        help="Max concurrent scraping workers"
+    ),
+    flush_every: int = typer.Option(
+        250,
+        "--flush-every",
+        help="Append to CSV every N new profiles"
+    ),
+    india_only: bool = typer.Option(
+        True,
+        "--india-only/--no-india-only",
+        help="Keep only profiles likely from India"
+    ),
+    exclude_students: bool = typer.Option(
+        True,
+        "--exclude-students/--include-students",
+        help="Exclude student profiles"
+    ),
+):
+    """
+    🚀 Bulk-collect Indian tutor profiles (classes 1–12) across subjects and cities with concurrency.
+
+    Strategy:
+    - Iterate a grid of subjects × cities with multiple scrapers.
+    - Small per-task limits, high coverage, dedup by profile link.
+    - Periodic CSV appends to avoid memory and enable progress.
+    """
+    create_env_if_missing()
+
+    console.print(f"\n[bold cyan]🎓 TuitionDataCollector (Bulk Mode)[/bold cyan]\n")
+    console.print(f"[bold]Target:[/bold] {target_count}")
+    console.print(f"[bold]Workers:[/bold] {max_workers}")
+    console.print(f"[bold]Output:[/bold] {output} -> {output_path}")
+    console.print(f"[bold]India-only:[/bold] {india_only}")
+    console.print(f"[bold]Exclude students:[/bold] {exclude_students}\n")
+
+    # Define coverage
+    subjects = [
+        "math", "science", "english", "physics", "chemistry", "biology",
+        "computer", "hindi", "social science"
+    ]
+    cities = [
+        "delhi", "mumbai", "bangalore", "chennai", "kolkata", "pune", "hyderabad",
+        "ahmedabad", "jaipur", "lucknow", "kanpur", "nagpur", "indore", "thane",
+        "bhopal", "visakhapatnam", "patna", "vadodara", "ghaziabad", "ludhiana",
+        "agra", "nashik", "faridabad", "meerut", "rajkot", "varanasi"
+    ]
+
+    # Scrapers: prefer API if configured
+    api_scraper = GoogleAPISearcher()
+    scrapers: List[Tuple[str, object]] = []
+    if api_scraper.is_configured():
+        scrapers.append(("Google API", api_scraper))
+    else:
+        scrapers.append(("Google HTML", GoogleScraper()))
+    scrapers.extend([
+        ("Superprof", SuperprofScraper()),
+        ("UrbanPro", UrbanProScraper()),
+        ("Direct", UniversalTutorScraper()),
+    ])
+
+    # Build queries (class 1-12 emphasis)
+    def build_query(subj: str, city: str) -> str:
+        return f"{subj} tutor for class 1 to 12 in {city}, India"
+
+    # Task generator
+    tasks: List[Tuple[str, object, str, int]] = []  # (source_name, scraper, query, limit)
+    per_task_limit = 30  # keep small to reduce blocking/ban risk
+    for subj in subjects:
+        for city in cities:
+            q = build_query(subj, city)
+            for source_name, scraper in scrapers:
+                tasks.append((source_name, scraper, q, per_task_limit))
+
+    collected: List[Dict] = []
+    seen_keys: Set[str] = set()
+    saved_total = 0
+
+    def profile_key(p: Dict) -> str:
+        link = (p.get("profile_link") or "").strip().lower()
+        if link:
+            return link
+        # Fallback key
+        return f"{p.get('name','').strip().lower()}|{p.get('source','').strip().lower()}"
+
+    def submit_task(executor, source_name, scraper, query, limit):
+        # Wrap to return with metadata
+        try:
+            results = scraper.scrape(query, limit)
+            return source_name, query, results
+        except Exception as e:
+            logger.error(f"[red]Error in {source_name} for '{query}': {e}[/red]")
+            return source_name, query, []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(submit_task, executor, src, scr, q, l)
+            for (src, scr, q, l) in tasks
+        ]
+
+        for fut in as_completed(futures):
+            src_name, q, results = fut.result()
+
+            # Post-filters and dedup
+            for p in results:
+                if exclude_students and p.get("role", "").lower() == "student":
+                    continue
+                if india_only and not is_indian_profile(p):
+                    continue
+                k = profile_key(p)
+                if not k or k in seen_keys:
+                    continue
+                seen_keys.add(k)
+                collected.append(p)
+
+            # Periodic flush
+            if len(collected) - saved_total >= flush_every:
+                console.print(f"[cyan]💾 Flushing {len(collected) - saved_total} new profiles...[/cyan]")
+                save_data(collected[saved_total:], output_format=output, output_path=output_path, separate_by_role=True, append_mode=True)
+                saved_total = len(collected)
+
+            # Stop early when target reached
+            if len(collected) >= target_count:
+                break
+
+        # Final flush
+        if len(collected) > saved_total:
+            console.print(f"[cyan]💾 Final flush {len(collected) - saved_total} profiles...[/cyan]")
+            save_data(collected[saved_total:], output_format=output, output_path=output_path, separate_by_role=True, append_mode=True)
+
+    console.print(f"\n[bold green]✓ Bulk collection complete: {len(collected)} profiles (deduped)[/bold green]")
+    console.print(f"[green]📁 Data saved to: {output_path}[/green]")
+
+
 # Demo command removed - use 'fetch' for real data collection
 
 
@@ -326,6 +486,41 @@ def version():
     """
     console.print("\n[bold cyan]TuitionDataCollector v1.0.0[/bold cyan]")
     console.print("[dim]Python-based CLI for ethical tutor/student data collection[/dim]\n")
+
+
+@app.command()
+def playwright_scrape(
+    target: int = typer.Option(500, "--target", "-t", help="Target number of profiles"),
+    workers: int = typer.Option(4, "--workers", "-w", help="Concurrent async workers"),
+    output_path: str = typer.Option("data/tutors_play.csv", "--output-path", "-p", help="CSV output path"),
+):
+    """
+    ⚙️ Run Playwright-based async scraper with proxy rotation and API fallback.
+
+    Configure proxies via WEBSHARE_PROXIES env (comma-separated). Optionally set USER_AGENTS.
+    """
+    create_env_if_missing()
+    console.print("\n[bold cyan]🎭 Playwright Async Scraper[/bold cyan]\n")
+    console.print(f"[bold]Target:[/bold] {target}")
+    console.print(f"[bold]Workers:[/bold] {workers}")
+    console.print(f"[bold]Output:[/bold] {output_path}\n")
+
+    subjects = [
+        "math", "science", "english", "physics", "chemistry", "biology",
+        "computer", "hindi", "social science"
+    ]
+    cities = [
+        "delhi", "mumbai", "bangalore", "chennai", "kolkata", "pune", "hyderabad"
+    ]
+
+    try:
+        import asyncio
+        total = asyncio.run(run_async_scrape(subjects, cities, workers=workers, target=target, flush_every=100, output_path=output_path))
+        console.print(f"\n[bold green]✓ Playwright run complete: {total} profiles collected[/bold green]")
+        console.print(f"[green]📁 CSV saved to: {output_path}[/green]")
+    except Exception as e:
+        logger.error(f"[red]Playwright scraping failed: {e}[/red]")
+        raise typer.Exit(1)
 
 
 @app.callback(invoke_without_command=True)

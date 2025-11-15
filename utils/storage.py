@@ -8,13 +8,47 @@ from pathlib import Path
 from utils.logger import logger
 from utils.database import MongoDBHandler
 
-# Try to import pandas, but make it optional
+# Try to import pandas, but make it optional and allow disabling via env
 try:
-    import pandas as pd
-    PANDAS_AVAILABLE = True
+    import os as _os
+    _disable_pandas = _os.getenv('DISABLE_PANDAS', '').strip() in ('1', 'true', 'yes')
+    if not _disable_pandas:
+        import pandas as pd  # type: ignore
+        PANDAS_AVAILABLE = True
+    else:
+        PANDAS_AVAILABLE = False
+        logger.info("[dim]DISABLE_PANDAS set: using CSV module for file writing[/dim]")
 except ImportError:
     PANDAS_AVAILABLE = False
     logger.warning("Pandas not available, using CSV module for file writing")
+
+
+def _dedup_records(data: List[Dict]) -> List[Dict]:
+    """
+    Deduplicate list of dicts based on stable key: profile_link else name|source.
+    Keeps first occurrence.
+    """
+    seen = set()
+    unique: List[Dict] = []
+
+    def key_fn(x: Dict) -> str:
+        link = (x.get('profile_link') or '').strip().lower()
+        if link:
+            return link
+        name = (x.get('name') or '').strip().lower()
+        source = (x.get('source') or '').strip().lower()
+        return f"{name}|{source}"
+
+    for item in data:
+        k = key_fn(item)
+        if not k:
+            # If we cannot form a key, include once using object id guard
+            k = f"__idx__:{id(item)}"
+        if k in seen:
+            continue
+        seen.add(k)
+        unique.append(item)
+    return unique
 
 
 def save_to_csv(data: List[Dict], output_path: str = "data/tutors.csv") -> bool:
@@ -33,10 +67,33 @@ def save_to_csv(data: List[Dict], output_path: str = "data/tutors.csv") -> bool:
         output_file = Path(output_path)
         output_file.parent.mkdir(parents=True, exist_ok=True)
         
+        # Dedup incoming data first
+        data = _dedup_records(data)
+
         if PANDAS_AVAILABLE:
             # Use pandas if available
-            df = pd.DataFrame(data)
-            df.to_csv(output_path, index=False, encoding='utf-8')
+            try:
+                df = pd.DataFrame(data)
+                # Drop duplicate rows by identity key if present
+                key_cols = [c for c in ['profile_link', 'name', 'source'] if c in df.columns]
+                if key_cols:
+                    # Prefer profile_link; if absent, use name+source
+                    subset = ['profile_link'] if 'profile_link' in key_cols else key_cols
+                    df = df.drop_duplicates(subset=subset, keep='first')
+                df.to_csv(output_path, index=False, encoding='utf-8')
+            except Exception as e:
+                logger.warning(f"[yellow]Pandas write failed, falling back to CSV module: {e}[/yellow]")
+                # Fallback to CSV module
+                if not data:
+                    return False
+                fieldnames = set()
+                for item in data:
+                    fieldnames.update(item.keys())
+                fieldnames = sorted(list(fieldnames))
+                with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
+                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(data)
         else:
             # Fallback to CSV module
             if not data:
@@ -123,24 +180,24 @@ def save_data(data: List[Dict], output_format: str = "csv", output_path: str = N
                 # Load existing tutors
                 if Path(tutor_path).exists():
                     try:
-                        import pandas as pd
-                        existing_tutors_df = pd.read_csv(tutor_path)
-                        existing_tutors = existing_tutors_df.to_dict('records')
-                    except:
-                        pass
+                        with open(tutor_path, 'r', encoding='utf-8') as f:
+                            reader = csv.DictReader(f)
+                            existing_tutors = list(reader)
+                    except Exception as _e:
+                        logger.debug(f"Failed reading existing tutors CSV, continuing without merge: {_e}")
                 
                 # Load existing students
                 if Path(student_path).exists():
                     try:
-                        import pandas as pd
-                        existing_students_df = pd.read_csv(student_path)
-                        existing_students = existing_students_df.to_dict('records')
-                    except:
-                        pass
+                        with open(student_path, 'r', encoding='utf-8') as f:
+                            reader = csv.DictReader(f)
+                            existing_students = list(reader)
+                    except Exception as _e:
+                        logger.debug(f"Failed reading existing students CSV, continuing without merge: {_e}")
             
             # Merge new and existing data
-            all_tutors = existing_tutors + tutors
-            all_students = existing_students + students
+            all_tutors = _dedup_records(existing_tutors + tutors)
+            all_students = _dedup_records(existing_students + students)
             
             # Save tutors
             if all_tutors:
@@ -159,12 +216,12 @@ def save_data(data: List[Dict], output_format: str = "csv", output_path: str = N
             # If no classification, save all
             if not tutors and not students:
                 csv_path = output_path or "data/all_profiles.csv"
-                if save_to_csv(data, csv_path):
+                if save_to_csv(_dedup_records(data), csv_path):
                     success = True
         else:
             # Save all together
             csv_path = output_path or "data/tutors.csv"
-            if save_to_csv(data, csv_path):
+            if save_to_csv(_dedup_records(data), csv_path):
                 success = True
     
     if output_format in ['mongo', 'both']:

@@ -2,8 +2,10 @@
 Google Custom Search API scraper for real tutor/student data
 """
 import os
+import time
+import random
 import requests
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from dotenv import load_dotenv
 from scraper.base import BaseScraper
 from utils.logger import logger
@@ -36,19 +38,45 @@ class GoogleAPISearcher(BaseScraper):
         self.base_url = "https://www.googleapis.com/customsearch/v1"
         self.current_key_index = 0
         self.key_usage = {i: 0 for i in range(len(self.api_keys))}
+        # Optional default site restriction to reduce irrelevant results
+        self.default_site = os.getenv('GOOGLE_SEARCH_SITE', '').strip()  # e.g., "site:superprof.co.in OR site:urbanpro.com"
+        # Backoff tracking per key
+        self._key_backoff_until: Dict[int, float] = {}
     
     def is_configured(self) -> bool:
         """Check if API is properly configured"""
         return bool(self.api_keys and self.search_engine_ids)
     
-    def get_next_api_key(self) -> tuple:
+    def get_next_api_key(self) -> Tuple[Optional[str], Optional[str], int]:
         """Get next API key and search engine ID (rotation)"""
         if not self.api_keys:
-            return None, None
+            return None, None, -1
         
         # Round-robin rotation
-        api_key = self.api_keys[self.current_key_index]
-        cx_id = self.search_engine_ids[min(self.current_key_index, len(self.search_engine_ids) - 1)]
+        start_idx = self.current_key_index
+        for _ in range(len(self.api_keys)):
+            idx = self.current_key_index
+            api_key = self.api_keys[idx]
+            cx_id = self.search_engine_ids[min(idx, len(self.search_engine_ids) - 1)]
+            until = self._key_backoff_until.get(idx, 0)
+            now = time.time()
+            self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+            if now >= until:
+                # Track usage
+                self.key_usage[idx] = self.key_usage.get(idx, 0) + 1
+                logger.info(f"[dim]Using API key #{idx + 1}/{len(self.api_keys)}[/dim]")
+                return api_key, cx_id, idx
+        # All keys are backed-off; sleep until earliest
+        next_ready = min(self._key_backoff_until.values()) if self._key_backoff_until else time.time() + 1
+        sleep_for = max(0.5, next_ready - time.time())
+        logger.warning(f"[yellow]All API keys in backoff. Sleeping {sleep_for:.1f}s...[/yellow]")
+        time.sleep(sleep_for)
+        # After wait, pick again
+        idx = self.current_key_index
+        api_key = self.api_keys[idx]
+        cx_id = self.search_engine_ids[min(idx, len(self.search_engine_ids) - 1)]
+        self.key_usage[idx] = self.key_usage.get(idx, 0) + 1
+        return api_key, cx_id, idx
         
         # Track usage
         self.key_usage[self.current_key_index] += 1
@@ -77,7 +105,7 @@ class GoogleAPISearcher(BaseScraper):
             return None
         
         # Get next API key for rotation
-        api_key, cx_id = self.get_next_api_key()
+        api_key, cx_id, key_idx = self.get_next_api_key()
         
         if not api_key:
             logger.error("[red]No API keys available[/red]")
@@ -92,17 +120,21 @@ class GoogleAPISearcher(BaseScraper):
         }
         
         try:
+            # Optional per-request pacing
+            time.sleep(0.2 + random.uniform(0, 0.2))
             response = requests.get(self.base_url, params=params, timeout=self.timeout)
-            
             if response.status_code == 200:
                 return response.json()
-            elif response.status_code == 429:
-                logger.warning(f"[yellow]API rate limit reached for key #{self.current_key_index}. Rotating to next key...[/yellow]")
+            if response.status_code in (429, 500, 502, 503):
+                # backoff this key progressively
+                prev_until = self._key_backoff_until.get(key_idx, 0)
+                base = 2 ** (int(prev_until > time.time()) + 1)
+                backoff = min(60, base + random.uniform(0, 1.0))
+                self._key_backoff_until[key_idx] = time.time() + backoff
+                logger.warning(f"[yellow]API HTTP {response.status_code} for key #{key_idx+1}. Backing off {backoff:.1f}s and rotating...[/yellow]")
             else:
                 logger.warning(f"[yellow]API returned status {response.status_code}[/yellow]")
-            
             return None
-        
         except Exception as e:
             logger.error(f"[red]API request error: {e}[/red]")
             return None
@@ -160,7 +192,11 @@ class GoogleAPISearcher(BaseScraper):
             logger.info("[cyan]Get API key: https://developers.google.com/custom-search/v1/introduction[/cyan]")
             return []
         
-        logger.info(f"[cyan]🔍 Searching via Google API: '{query}'[/cyan]")
+        # Optionally inject site restriction to improve precision while staying under limits
+        eff_query = query
+        if self.default_site:
+            eff_query = f"({query}) {self.default_site}"
+        logger.info(f"[cyan]🔍 Searching via Google API: '{eff_query}'[/cyan]")
         
         all_profiles = []
         pages_needed = (limit // 10) + 1
@@ -174,7 +210,7 @@ class GoogleAPISearcher(BaseScraper):
             
             logger.info(f"[blue]Fetching results {start_index}-{start_index + 9}...[/blue]")
             
-            results = self.search(query, start_index=start_index, num_results=10)
+            results = self.search(eff_query, start_index=start_index, num_results=10)
             
             if not results:
                 break
@@ -192,7 +228,7 @@ class GoogleAPISearcher(BaseScraper):
                 break
             
             # Small delay between API calls
-            self.random_delay(0.5, 1.0)
+            self.random_delay(0.3, 0.7)
         
         logger.info(f"[green]✓ Found {len(all_profiles)} results via Google API[/green]")
         return all_profiles[:limit]

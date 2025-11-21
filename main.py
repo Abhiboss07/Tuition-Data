@@ -4,6 +4,7 @@ TuitionDataCollector - CLI tool for scraping tutor/student data
 import os
 import sys
 import time
+import random
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,7 +25,7 @@ from scraper.direct_scraper import UniversalTutorScraper
 from scraper.async_playwright_scraper import run_async_scrape
 from utils.storage import save_data
 from utils.logger import logger
-from utils.classifier import filter_tutors_by_experience, is_indian_profile
+from utils.classifier import filter_tutors_by_experience, is_indian_profile, parse_experience_years
 
 # Load environment variables
 load_dotenv()
@@ -91,6 +92,16 @@ def fetch(
         "--source",
         "-s",
         help="Data source: google, api, urbanpro, superprof, direct, or all"
+    ),
+    only_api: bool = typer.Option(
+        False,
+        "--only-api/--all-sources",
+        help="Use only Google Custom Search API (recommended for scale)"
+    ),
+    api_sites: Optional[str] = typer.Option(
+        None,
+        "--api-sites",
+        help="Optional site filter for API queries, e.g. 'site:superprof.co.in OR site:urbanpro.com OR site:teacheron.com'"
     ),
     query: str = typer.Option(
         ...,
@@ -340,7 +351,7 @@ def bulk(
         help="CSV path to save (append mode)"
     ),
     max_workers: int = typer.Option(
-        6,
+        8,
         "--workers",
         "-w",
         help="Max concurrent scraping workers"
@@ -349,6 +360,11 @@ def bulk(
         250,
         "--flush-every",
         help="Append to CSV every N new profiles"
+    ),
+    max_experience: int = typer.Option(
+        5,
+        "--max-experience",
+        help="Keep tutors with strictly less than this many years of experience"
     ),
     india_only: bool = typer.Option(
         True,
@@ -359,6 +375,16 @@ def bulk(
         True,
         "--exclude-students/--include-students",
         help="Exclude student profiles"
+    ),
+    only_api: bool = typer.Option(
+        False,
+        "--only-api/--all-sources",
+        help="Use only Google Custom Search API (recommended for scale)"
+    ),
+    api_sites: Optional[str] = typer.Option(
+        None,
+        "--api-sites",
+        help="Optional site filter for API queries, e.g. 'site:superprof.co.in OR site:urbanpro.com OR site:teacheron.com'"
     ),
 ):
     """
@@ -376,18 +402,27 @@ def bulk(
     console.print(f"[bold]Workers:[/bold] {max_workers}")
     console.print(f"[bold]Output:[/bold] {output} -> {output_path}")
     console.print(f"[bold]India-only:[/bold] {india_only}")
-    console.print(f"[bold]Exclude students:[/bold] {exclude_students}\n")
+    console.print(f"[bold]Max Experience:[/bold] < {max_experience} years")
+    console.print(f"[bold]Exclude students:[/bold] {exclude_students}")
+    console.print(f"[bold]Only API:[/bold] {only_api}")
+    if api_sites:
+        console.print(f"[bold]API site filter:[/bold] {api_sites}")
+    console.print()
 
     # Define coverage
     subjects = [
         "math", "science", "english", "physics", "chemistry", "biology",
-        "computer", "hindi", "social science"
+        "computer", "hindi", "social science", "accounting", "economics",
+        "history", "geography", "civics", "environmental science"
     ]
     cities = [
+        # Tier-1/2
         "delhi", "mumbai", "bangalore", "chennai", "kolkata", "pune", "hyderabad",
         "ahmedabad", "jaipur", "lucknow", "kanpur", "nagpur", "indore", "thane",
         "bhopal", "visakhapatnam", "patna", "vadodara", "ghaziabad", "ludhiana",
-        "agra", "nashik", "faridabad", "meerut", "rajkot", "varanasi"
+        "agra", "nashik", "faridabad", "meerut", "rajkot", "varanasi",
+        # A few more large cities
+        "surat", "noida", "gurgaon", "coimbatore", "trichy"
     ]
 
     # Scrapers: prefer API if configured
@@ -397,24 +432,36 @@ def bulk(
         scrapers.append(("Google API", api_scraper))
     else:
         scrapers.append(("Google HTML", GoogleScraper()))
-    scrapers.extend([
-        ("Superprof", SuperprofScraper()),
-        ("UrbanPro", UrbanProScraper()),
-        ("Direct", UniversalTutorScraper()),
-    ])
+    if not only_api:
+        scrapers.extend([
+            ("Superprof", SuperprofScraper()),
+            ("UrbanPro", UrbanProScraper()),
+            ("Direct", UniversalTutorScraper()),
+        ])
 
     # Build queries (class 1-12 emphasis)
     def build_query(subj: str, city: str) -> str:
-        return f"{subj} tutor for class 1 to 12 in {city}, India"
+        # Vary phrasing to broaden recall
+        variants = [
+            f"{subj} tutor for class 1 to 12 in {city}, India",
+            f"{subj} teacher near {city} India for school students",
+            f"home tutor {subj} {city} India class 1-12",
+        ]
+        return random.choice(variants)
 
     # Task generator
     tasks: List[Tuple[str, object, str, int]] = []  # (source_name, scraper, query, limit)
-    per_task_limit = 30  # keep small to reduce blocking/ban risk
+    per_task_limit_api = int(os.getenv("BULK_API_PER_TASK_LIMIT", "50"))  # fetch more pages per API query
+    per_task_limit_html = int(os.getenv("BULK_HTML_PER_TASK_LIMIT", "20"))  # keep small for HTML scrapers
     for subj in subjects:
         for city in cities:
             q = build_query(subj, city)
             for source_name, scraper in scrapers:
-                tasks.append((source_name, scraper, q, per_task_limit))
+                is_api = isinstance(scraper, GoogleAPISearcher)
+                # If using API and site filters provided, append them to query
+                final_q = f"{q} {api_sites}" if (is_api and api_sites) else q
+                limit = per_task_limit_api if is_api else per_task_limit_html
+                tasks.append((source_name, scraper, final_q, limit))
 
     collected: List[Dict] = []
     seen_keys: Set[str] = set()
@@ -427,10 +474,20 @@ def bulk(
         # Fallback key
         return f"{p.get('name','').strip().lower()}|{p.get('source','').strip().lower()}"
 
+    # Limit in-flight API tasks to avoid 429 bursts
+    import threading
+    api_max = max(1, int(os.getenv("BULK_MAX_CONCURRENT_API", "2")))
+    html_max = max(1, int(os.getenv("BULK_MAX_CONCURRENT_HTML", "4")))
+    api_sem = threading.Semaphore(api_max)
+    html_sem = threading.Semaphore(html_max)
+
     def submit_task(executor, source_name, scraper, query, limit):
         # Wrap to return with metadata
         try:
-            results = scraper.scrape(query, limit)
+            is_api = isinstance(scraper, GoogleAPISearcher)
+            sem = api_sem if is_api else html_sem
+            with sem:
+                results = scraper.scrape(query, limit)
             return source_name, query, results
         except Exception as e:
             logger.error(f"[red]Error in {source_name} for '{query}': {e}[/red]")
@@ -447,9 +504,15 @@ def bulk(
 
             # Post-filters and dedup
             for p in results:
+                # Only tutors
                 if exclude_students and p.get("role", "").lower() == "student":
                     continue
+                # India-only heuristic
                 if india_only and not is_indian_profile(p):
+                    continue
+                # Experience strictly less than max_experience and known
+                years = parse_experience_years(str(p.get("experience") or ""))
+                if years is None or years >= max_experience:
                     continue
                 k = profile_key(p)
                 if not k or k in seen_keys:
@@ -463,7 +526,7 @@ def bulk(
                 save_data(collected[saved_total:], output_format=output, output_path=output_path, separate_by_role=True, append_mode=True)
                 saved_total = len(collected)
 
-            # Stop early when target reached
+            # Stop early when target reached (remaining futures will still complete, but we won't append more)
             if len(collected) >= target_count:
                 break
 

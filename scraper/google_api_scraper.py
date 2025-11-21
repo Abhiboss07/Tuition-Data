@@ -6,6 +6,7 @@ import time
 import random
 import requests
 from typing import List, Dict, Optional, Tuple
+import threading
 from dotenv import load_dotenv
 from scraper.base import BaseScraper
 from utils.logger import logger
@@ -25,6 +26,10 @@ class GoogleAPISearcher(BaseScraper):
        GOOGLE_SEARCH_ENGINE_ID=your_cx_id
     """
     
+    # Global throttle across all instances
+    _GLOBAL_SEM: Optional[threading.Semaphore] = None
+    _GLOBAL_LAST_CALL: float = 0.0
+
     def __init__(self):
         super().__init__()
         # Support multiple API keys (comma-separated)
@@ -42,6 +47,17 @@ class GoogleAPISearcher(BaseScraper):
         self.default_site = os.getenv('GOOGLE_SEARCH_SITE', '').strip()  # e.g., "site:superprof.co.in OR site:urbanpro.com"
         # Backoff tracking per key
         self._key_backoff_until: Dict[int, float] = {}
+        # Deep fetch settings to extract experience/location from profile pages
+        # Default disabled for performance; enable via env if needed
+        self.deep_fetch = os.getenv('GOOGLE_API_DEEP_FETCH', 'false').strip().lower() in ('1', 'true', 'yes')
+        try:
+            self.deep_fetch_per_page = max(0, int(os.getenv('GOOGLE_API_DEEP_FETCH_PER_PAGE', '5')))
+        except Exception:
+            self.deep_fetch_per_page = 5
+        try:
+            self.deep_fetch_max_chars = max(0, int(os.getenv('GOOGLE_API_DEEP_FETCH_MAX_CHARS', '2000')))
+        except Exception:
+            self.deep_fetch_max_chars = 2000
     
     def is_configured(self) -> bool:
         """Check if API is properly configured"""
@@ -120,9 +136,19 @@ class GoogleAPISearcher(BaseScraper):
         }
         
         try:
-            # Optional per-request pacing
-            time.sleep(0.2 + random.uniform(0, 0.2))
-            response = requests.get(self.base_url, params=params, timeout=self.timeout)
+            # Global concurrency throttle across threads to avoid burst 429
+            if GoogleAPISearcher._GLOBAL_SEM is None:
+                max_conc = int(os.getenv('GOOGLE_API_MAX_CONCURRENT', '2'))
+                GoogleAPISearcher._GLOBAL_SEM = threading.Semaphore(max(1, max_conc))
+            with GoogleAPISearcher._GLOBAL_SEM:
+                # Per-call pacing (min interval between any two API calls)
+                min_interval = float(os.getenv('GOOGLE_API_MIN_INTERVAL_SEC', '0.25'))
+                now = time.time()
+                delta = now - GoogleAPISearcher._GLOBAL_LAST_CALL
+                if delta < min_interval:
+                    time.sleep(min_interval - delta + random.uniform(0, 0.1))
+                GoogleAPISearcher._GLOBAL_LAST_CALL = time.time()
+                response = requests.get(self.base_url, params=params, timeout=self.timeout)
             if response.status_code == 200:
                 return response.json()
             if response.status_code in (429, 500, 502, 503):
@@ -153,7 +179,7 @@ class GoogleAPISearcher(BaseScraper):
         
         items = results.get('items', [])
         
-        for item in items:
+        for idx, item in enumerate(items):
             title = item.get('title', '')
             link = item.get('link', '')
             snippet = item.get('snippet', '')
@@ -162,10 +188,25 @@ class GoogleAPISearcher(BaseScraper):
             if any(domain in link.lower() for domain in ['youtube.com', 'facebook.com', 'twitter.com', 'instagram.com']):
                 continue
             
+            # Optionally fetch page content (limited per page) to help extract experience/location
+            page_text = ''
+            if self.deep_fetch and idx < self.deep_fetch_per_page:
+                try:
+                    html = self.fetch_page(link)
+                    if html:
+                        # Crude text extraction without heavy parsing to keep it light
+                        from bs4 import BeautifulSoup
+                        soup = BeautifulSoup(html, 'html.parser')
+                        text = soup.get_text(separator=' ', strip=True)
+                        if text:
+                            page_text = text[: self.deep_fetch_max_chars]
+                except Exception:
+                    pass
+
             profile = {
                 'name': title,
                 'title': title,
-                'description': snippet,
+                'description': (snippet + ' ' + page_text).strip() if page_text else snippet,
                 'profile_link': link,
                 'source': f'Google API Search',
                 'location': None,
